@@ -1,0 +1,1213 @@
+# BEFORE RUNNING:
+#   download heatmap format helper script from: https://raw.githubusercontent.com/obigriffith/biostar-tutorials/master/Heatmaps/heatmap.3.R
+#   change working directory below
+
+start.time <- proc.time()
+
+# SET DIRECTORY
+# Directory must contain all .idat files and .csv manifest, and heatmap formatting script
+# This is where all the graphs will be saved to
+
+setwd("~/Desktop/Research/AMD/Methylation/EyeBank/Data/raw/Eye Methylation Project/")
+
+# PACKAGE INSTALLATION FUNCTION
+# helper function to install package if not already installed
+usePackage <- function(p) {
+  if (!is.element(p, installed.packages()[,1]))
+    install.packages(p, dep = TRUE)
+  require(p, character.only = TRUE)
+}
+
+
+# LOADING LIBRARIES
+# Some calls are repeated in relevant sections, ignore these
+usePackage('BiocInstaller') # package dependency installer
+usePackage('ChAMP') # .idat extraction
+usePackage('scatterplot3d') # 3d scatterplot drawings
+usePackage('plyr') # data wrangling helper
+usePackage('car') #  data wrangling helper
+usePackage('limma') # linear regression analysis
+usePackage('WGCNA') # PCA helper
+usePackage('lumi') # to convert M to beta
+usePackage('gplots')
+usePackage('gtools') # a dependency of heatmap.3.R
+if(!exists("foo", mode="function")) source("heatmap.3.R") # download script from https://raw.githubusercontent.com/obigriffith/biostar-tutorials/master/Heatmaps/heatmap.3.R
+usePackage('ggplot2') # favourite library for scatter plots!
+usePackage('reshape') # data.frame parsing helper
+usePackage('gtable') # ggplot layout tool
+usePackage('RColorBrewer') # colours
+usePackage("VennDiagram") # for Venn diagrams
+usePackage("matrixStats") # for CV calculations
+usePackage("UpSetR") # for revamped Venn diagrams
+
+# GET DATA
+# The ChaMP package gets RGset and beta using minfi, performs QC, removes XY, SNP and
+# overlapping probes by default. Variable must be stored in 'myLoad',
+# otherwise this must be specified in the argument for other ChAMP functions.
+myLoad <- champ.load(filterXY = FALSE)
+myLoad$m <- getM(myLoad$mset) # default is beta so this adds M-values
+
+
+# NORMALIZE DATA
+# Default method is BMIQ but can be specified as argument. Uses myLoad as default.
+# BMIQ chosen for current analysis due to studies showing slightly higher reproducibility.
+# But differences are modest so normalisation method should not matter as much.
+myNorm <- champ.norm(filterXY = FALSE)
+myNorm$m <- log2(myNorm$beta/(1-myNorm$beta))
+
+
+# PLOT MDS AND SAVE AS PNG
+png('MDS_beta_BMIQ.png', width=1000, height=600)
+mdsPlot(myNorm$beta, sampNames = myLoad$mset@phenoData@data$Sample_Name, 
+        sampGroups = myLoad$mset@phenoData@data$Sample_Group, 
+        legendPos = "topright", legendNCol = 2)
+dev.off()
+
+png('MDS_m_BMIQ.png', width=1000, height=600)
+mdsPlot(myNorm$m, sampNames = myLoad$mset@phenoData@data$Sample_Name, 
+        sampGroups = myLoad$mset@phenoData@data$Sample_Group, 
+        legendPos = "topright", legendNCol = 2)
+dev.off()
+
+######################################################################################
+
+# SETTING HELPER VARIABLES 
+M <- myNorm$m[,-c(1, 2, 3)] # the subset removes controls
+n <- ncol(M)
+sampleTypes <- myLoad$mset@phenoData@data$Sample_Group[-c(1:3)]
+sampleColours <- recode(sampleTypes,"'blood'='#F43D6B';'choroid'='#83F03C';'retina'='#534ED9'; 'opticnerve'='#FFD140'")
+sampleColours <- t(data.frame(sampleColours))
+rownames(sampleColours) <- c("Tissue")
+sampleColourSwatch <- c('#F43D6B', '#83F03C', '#534ED9', '#FFD140')
+# creating colour scale for heatmap
+interpolateSequentialColour <- colorRampPalette(c('#4292c6', '#FFFFFF'))
+seq.color.scale <- interpolateSequentialColour(19)
+# setting up phenotype table
+phenotype <- myLoad$mset@phenoData@data[-c(1:3),]
+phenoForComBat <- phenotype
+phenotype$ID <- phenotype$Sample_Name
+phenotype$individual <- substr(phenotype$Sample_Name, 1, 4)
+phenotype$tissue <- sampleTypes
+phenotype$tissuebinary <- recode(sampleTypes,"'blood'='blood';'choroid'='eye';'retina'='eye'; 'opticnerve'='eye'")
+phenotype$chip <- phenotype$Slide
+indColours <- recode(phenotype$individual,'"3631" = "#8dd3c7"; "3675" = "#ffffb3"; "3677" = "#bebada"; "3684" = "#fb8072"; "3685" = "#80b1d3"; "3689" = "#fdb462"; "3682" = "#b3de69" ;  "3701" = "#fccde5"')
+indColours <- t(data.frame(indColours))
+rownames(indColours) <- c("Individual")
+# cleaning up phenotype dataframe
+phenotype$Sample_Name <- NULL
+phenotype$Basename <- NULL
+phenotype$Pool_ID <- NULL
+phenotype$Sample_Well <- NULL
+phenotype$Sample_Plate <- NULL
+phenotype$Sample_Group <- NULL
+phenotype$Array <- NULL
+phenotype$Slide <- NULL
+phenotype$filenames <- NULL
+pheno.ordinal <- data.frame(
+  individual = as.numeric(as.factor(phenotype$individual)),
+  tissue = as.numeric(as.factor(phenotype$tissue)),
+  tissuebinary = as.numeric(as.factor(phenotype$tissuebinary)),
+  chip = as.numeric(as.factor(phenotype$chip))
+)
+# more detailed phenotypes from supplementary table
+pdet <- read.table("Phenotype/phenotype_extra.csv", header = TRUE, sep = ",")
+phenodetail <- join(phenotype, pdet, by='individual', type='left', match='all')
+rownames(phenodetail) <- rownames(phenotype)
+phenodetail.ordinal <- data.frame(
+  individual = as.numeric(as.factor(phenodetail$individual)),
+  age_at_death = as.numeric(phenodetail$age_at_death),
+  preservation_time_interval = as.numeric(phenodetail$PTI),
+  cause_of_death = as.numeric(as.factor(phenodetail$cause_of_death)),
+  diabetes = as.numeric(phenodetail$diabetes),
+  hypertension = as.numeric(phenodetail$hypertension),
+  hypercholesterolemia = as.numeric(phenodetail$hypercholesterolemia),
+  ischemia = as.numeric(phenodetail$ischemia),
+  peptic_ulcer = as.numeric(phenodetail$peptic_ulcer),
+  depression = as.numeric(phenodetail$depression),
+  asthma = as.numeric(phenodetail$asthma),
+  cancer = as.numeric(phenodetail$cancer)
+)
+rm(pdet)
+
+# separating tissues (unadjusted)
+M.blood <- M[, substr(colnames(M), 5, 5) == "B"]
+M.choroid <- M[, substr(colnames(M), 5, 5) == "C"]
+M.opticnerve <- M[, substr(colnames(M), 5, 5) == "O"]
+M.retina <- M[, substr(colnames(M), 5, 5) == "R"]
+
+
+# HIERARCHICAL CLUSTERING
+svg('hclust_M')
+hc <- hclust(dist(t(M))) # computing distance matrix and apply clustering
+plot(hc)
+dev.off()
+
+
+# PRINCIPAL COMPONENTS ANALYSIS (UNADJUSTED)
+# all analyses performed with M-values unless indicated, and excludes the 3 controls
+# creating a PCA function:
+PCA <- function(m, phenotype, PCnum = 20, scatterplot = FALSE, scatterplotname = 'PC_3d.png', heatmapname = 'PC_corr.png', heatmaptitle = "Correlation between PC and traits", imgwidth = 1000, imgheight = 500) {
+  require(WGCNA)
+  n <- ncol(m)
+  pc <- prcomp(t(m), center=TRUE, scale=TRUE)
+  pc.df <- data.frame(pc$x)
+  # draw scatterplot (not drawn by default)
+  if (scatterplot) {
+    png(scatterplotname, width=500, height=500)
+    scatterplot3d(pc.df$PC2, pc.df$PC1, pc.df$PC3, 
+                  angle = 135, xlab="PC2", ylab="PC1", zlab="PC3", 
+                  pch=21, type="p", grid=T, color=sampleColours, label.tick.marks=T)
+    dev.off()
+  }
+  # correlate with traits and draw correlation heatmap
+  trait_corr <- cor(pc$x[, c(1:PCnum)], phenotype, use = "p")
+  trait_p <- corPvalueStudent(trait_corr, n)
+  text_matrix <- paste(signif(trait_corr, 2), "\n(", 
+                       signif(trait_p, 1), ")", sep = "") # creates and positions text above PCA map
+  dim(text_matrix) <- dim(trait_corr)
+  png(heatmapname, width = imgwidth, height = imgheight)
+  labeledHeatmap(Matrix = t(trait_corr),
+                 xLabels = colnames(pc$x),
+                 yLabels = names(phenotype),
+                 colorLabels = FALSE,
+                 colors = blueWhiteRed(6),
+                 textMatrix = t(text_matrix),
+                 zlim = c(-1,1),
+                 main = paste(heatmaptitle))
+  dev.off()
+}
+# all tissues
+PCA(M, phenotype = pheno.ordinal, PCnum = 20, scatterplot = TRUE, 
+    scatterplotname = 'PCA_all_3d.png', heatmapname = 'PCA_all_corr.png',
+    heatmaptitle = 'Correlation between PC and traits')
+# blood
+PCA(M.blood, phenotype = pheno.ordinal[pheno.ordinal$tissue == 1, ], 
+    PCnum = 7, heatmapname = 'PCA_blood_corr.png',
+    heatmaptitle = 'Correlation between PC and traits in blood')
+# choroid
+PCA(M.choroid, phenotype = pheno.ordinal[pheno.ordinal$tissue == 2, ], 
+    PCnum = 7, heatmapname = 'PCA_choroid_corr.png',
+    heatmaptitle = 'Correlation between PC and traits in choroid')
+# optic nerve
+PCA(M.opticnerve, phenotype = pheno.ordinal[pheno.ordinal$tissue == 3, ], 
+    PCnum = 7, heatmapname = 'PCA_opticnerve_corr.png',
+    heatmaptitle = 'Correlation between PC and traits in optic nerve')
+# retina
+PCA(M.retina, phenotype = pheno.ordinal[pheno.ordinal$tissue == 4, ], 
+    PCnum = 8, heatmapname = 'PCA_retina_corr.png',
+    heatmaptitle = 'Correlation between PC and traits in retina')
+# Issue: correlations assume linearity of ordinal variable. 
+# Heatmaps redone with ANOVA after batch-correction
+
+
+
+# BATCH CORRECTION
+# The PCA correlation matrix shows chip correlation, so need
+# to adjust for batch effects. Done using ChAMP which 
+# provides a batch correction function derived from sva
+batchNorm <- champ.runCombat(beta.c = M, pd = phenoForComBat, logitTrans = FALSE)
+batchM <- batchNorm$beta # even though this says beta, it's actually M-values. ChAMP names everything beta
+# separating tissues
+batchM.blood <- batchM[, substr(colnames(batchM), 5, 5) == "B"]
+batchM.choroid <- batchM[, substr(colnames(batchM), 5, 5) == "C"]
+batchM.opticnerve <- batchM[, substr(colnames(batchM), 5, 5) == "O"]
+batchM.retina <- batchM[, substr(colnames(batchM), 5, 5) == "R"]
+# repeat PCA for batch corrected M
+# all tissues
+PCA(batchM, phenotype = pheno.ordinal, PCnum = 20, scatterplot = TRUE, 
+    scatterplotname = 'PCA_all_batch_3d.png', heatmapname = 'PCA_all_batch_corr.png',
+    heatmaptitle = 'Correlation between PC and traits, adjusted for chip')
+
+# PCA with interindividual details
+PCA(batchM, phenodetail.ordinal, PCnum = 20, heatmapname = 'PCA_pheno_all.png', heatmaptitle = 'Correlation between individual traits and PC')
+
+
+# creating ANOVA function
+ANOVA <- function(pc_matrix, pheno_matrix) {
+  # function creates a matrix of P-values of ANOVA between PC and phenotype
+  # PC matrix: sample x PC
+  # pheno matrix: sample x phenotype, first column is ID and omitted from analysis
+  mat <- matrix(0, nrow = length(colnames(pc_matrix)), ncol = length(colnames(pheno_matrix)) - 1)
+  rownames(mat) <- colnames(pc_matrix)
+  colnames(mat) <- colnames(pheno_matrix)[-1]
+  for (i in 1:nrow(mat)) {
+    for (j in 1:ncol(mat)) {
+      mat[i, j] <- (summary(aov(pc_matrix[, i]~pheno_matrix[, j + 1]))[[1]]$'Pr(>F)'[[1]])
+    }
+  }
+  mat
+}
+# all analysis performed on batch-corrected values from now on #
+
+
+# PRINCIPAL COMPONENTS ANALYSIS (BATCH-ADJUSTED)
+pc <- prcomp(t(batchM), center=TRUE, scale=TRUE)
+# calculate contribution of CpG to PC
+loadings <- unclass(pc$rotation) # loadings show how much a PC explains variance in variable
+contributions <- sweep(abs(loadings), 2, colSums(abs(loadings)), "/") 
+# ANOVA with batch corrected PC
+anova <- ANOVA(pc$x, phenotype)
+# creating PC heatmap with ANOVA
+svg('PCA_ANOVA_batch', width = 8, height = 10)
+labeledHeatmap(Matrix = log10(anova),
+               xLabels = colnames(anova),
+               yLabels = colnames(pc$x),
+               colorLabels = FALSE,
+               colors = seq.color.scale,
+               textMatrix = signif(anova, 2),
+               cex.text = c(1, 1),
+               zlim = c(-20,0),
+               main = paste("ANOVA p-values of phenotypes and PC"))
+dev.off()
+
+# PC heatmap with ANOVA for individual phenotype
+anova.detail <- ANOVA(pc$x, phenodetail)
+# creating PC heatmap with ANOVA
+png('PCA_ANOVA_detail.png', width = 1000, height = 1000)
+labeledHeatmap(Matrix = log10(anova.detail),
+               xLabels = colnames(anova.detail),
+               yLabels = colnames(pc$x),
+               colorLabels = FALSE,
+               colors = seq.color.scale,
+               textMatrix = signif(anova, 2),
+               cex.text = c(1, 1),
+               zlim = c(-20,0),
+               main = paste("ANOVA p-values of detailed phenotypes and PC"))
+dev.off()
+
+# scree plot for percent of variance
+pcpov <- data.frame((pc$sdev^2/sum(pc$sdev^2)) * 100)
+pcpov$PC <- factor(rownames(pcpov), levels = as.numeric(rownames(pcpov)))
+colnames(pcpov) <- c('PropVar', 'PC')
+svg('Proportion of variance of PCs.svg', width = 8, height = 6)
+ggplot(pcpov, aes(x = PC, y = PropVar, group = 1)) +
+  geom_point() +
+  geom_path() + 
+  ylab("Proportion of Variance") + 
+  labs(title = "Proportion of Variance of PC")
+dev.off()
+
+# calculating correlation between CpG and PC
+cor_func <- function(loadings, sdev){
+  loadings * sdev
+}
+cor <- data.frame(t(apply(loadings, 1, cor_func, pc$sdev)))
+
+# calculates projections of CpG to PC as in Farre et al.     
+projection <- batchM %*% pc$x
+z <- data.frame(scale(projection, center = TRUE, scale = TRUE))
+
+
+
+# HEATMAP OF BETA VALUES
+library(lumi) # for conversion to beta
+# for pretty colour scales
+interpolateDivergingColour <- colorRampPalette(brewer.pal(9, 'Spectral'))
+div.color.scale <- rev(interpolateDivergingColour(80))
+# getting only 10000 most variable probes because using all of them requires too much computational power
+batchBeta <- m2beta(batchM)
+probe.sd <- data.frame(apply(batchBeta, 1, sd))
+colnames(probe.sd) <- c('SD')
+probe.sd <- data.frame(probe.sd[order(probe.sd$SD, decreasing =TRUE),
+                                , drop=FALSE])
+varprobe <- probe.sd[c(1:10000), , drop = FALSE]
+# filtering probes
+varBeta <- batchBeta[rownames(batchBeta) %in% rownames(varprobe), ]
+pdf('Figure 1B.pdf', height = 11.5, width = 9)
+heatmap.3(t(varBeta),
+          dendrogram = "row",
+          RowSideColors = sampleColours,
+          RowSideColorsSize = 1,
+          lmat=rbind(c(0, 0, 0, 0), c(5, 0, 0, 0), c(0, 4, 0, 0), c(3, 2, 1, 0), c(0, 0, 0, 0)), # positioning (see http://stackoverflow.com/questions/15351575/moving-color-key-in-r-heatmap-2-function-of-gplots-package)
+          lhei=c(0.3, 0.8, 0.5, 4, 0.3),
+          lwid=c(1, 4, 0.15, 0.3),
+          trace = "none",
+          scale = "none",
+          col = div.color.scale,
+          labRow = substr(rownames(t(varBeta)), 1, 4),
+          cexRow = 1.5,
+          labCol = " ",
+          main = "Heatmap of beta-values - 10,000 most variable probes")
+legend("topright", inset=c(-0.01, -0.01),
+       xpd = TRUE,
+       legend = c("Blood", "Choroid", "Retina",  "Optic Nerve"),
+       fill = c('#F43D6B', '#83F03C', '#534ED9', '#FFD140'),
+       border = FALSE,
+       bty = "n")
+dev.off()
+#TODO: still need to figure out how to add tissue labels to RowSideColors
+
+
+# REMOVE TISSUE-RELATED VARIATION
+# removing tissue-variance probes
+library(gplots)
+library(gtools)
+# filtering uncorrelated probes
+cor.xtissue <- cor[!(abs(cor$PC1) > 0.5), ] # r > 0.5 is arbitrary, sadly
+# PC5, 9, 11, 13 are correlated to individual variation according to ANOVA heatmap
+# PC5 shows blood vs eye variation (TODO: investigate further)
+# defining function to remove probes:
+probeFilter <- function(pcnum, exprobes = cor.xtissue) {
+  cor.pc <- exprobes[abs(exprobes[, pcnum]) > 0.5, ]
+  M <- batchM[rownames(batchM) %in% rownames(cor.pc), ]
+  beta <- batchBeta[rownames(batchBeta) %in% rownames(cor.pc), ]
+  list(M, beta)
+}
+
+# HEATMAPS WITH PRINCIPAL COMPONENTS
+# For this part, make sure to run the script from https://raw.githubusercontent.com/obigriffith/biostar-tutorials/master/Heatmaps/heatmap.3.R
+# this script allows multiple RowSideColors in heatmaps (for tissue and individual)
+# TODO: labels for RowSideColors
+# making the colour matrix for RowSideColors:
+colorMatrix <- rbind(sampleColours, indColours)
+# making heatmaps (all PCs correlated with individual through ANOVA, except those
+# correlated with chip):
+pcHeatmap <- function(betapc, pcnum) {
+  pdf(paste('heatmap_pc', pcnum, '.pdf', sep = ""), width = 9, height = 11.5)
+  heatmap.3(t(betapc),
+            dendrogram = "row",
+            RowSideColors = colorMatrix,
+            RowSideColorsSize = 2,
+            lmat=rbind(c(0, 0, 0, 0), c(5, 0, 0, 0), c(0, 4, 0, 0), c(3, 2, 1, 0), c(0, 0, 0, 0)), # positioning (see http://stackoverflow.com/questions/15351575/moving-color-key-in-r-heatmap-2-function-of-gplots-package)
+            lhei=c(0.3, 0.8, 0.5, 4, 0.3),
+            lwid=c(1, 4, 0.3, 0.3),
+            trace = "none",
+            scale = "none",
+            col = div.color.scale,
+            labRow = substr(rownames(t(betapc)), 1, 4),
+            cexRow = 2,
+            labCol = " ",
+            main = paste("Heatmap of PC", pcnum, "-associated probes", sep=""))
+  legend("topright", inset=c(-0.05, -0.01),
+         xpd = TRUE,
+         ncol = 2,
+         legend = c("Blood", "Choroid", "Retina",  "Optic Nerve", NA, NA, NA, NA, "3631", "3675" , "3677","3684", "3685", "3689","3682" , "3701"),
+         fill = c('#F43D6B', '#83F03C', '#534ED9', '#FFD140', NA, NA, NA, NA, "#8dd3c7", "#ffffb3", "#bebada", "#fb8072", "#80b1d3", "#fdb462", "#b3de69", "#fccde5"),
+         border = FALSE,
+         bty = "n")
+  dev.off()
+}
+# probe filtering and heatmapping combined:
+heatmapWrapperFunc <- function(pcnum, cor = cor.xtissue) {
+  probes <- probeFilter(pcnum, cor)
+  beta <- probes[[2]]
+  pcHeatmap(beta, pcnum)
+}
+heatmapWrapperFunc(5)
+heatmapWrapperFunc(6)
+heatmapWrapperFunc(7)
+heatmapWrapperFunc(8)
+heatmapWrapperFunc(9)
+heatmapWrapperFunc(10)
+heatmapWrapperFunc(11)
+heatmapWrapperFunc(12)
+heatmapWrapperFunc(13)
+# this gets probes that are highly correlated between tissues, with high inter-individual
+# variation, but NOT anti-correlated.
+
+# combining all interindividual-related probes:
+# probes9 <- probeFilter(9, cor)
+# probes11 <- probeFilter(11, cor)
+# probes13 <- probeFilter(13, cor)
+# ind.probes <- unique(rbind(probes9[[2]], probes11[[2]], probes13[[2]]))
+# pcHeatmap(ind.probes, "9-11-13 (interindividual variation)")
+# rm(probes9, probes11, probes13)
+
+
+
+# PLOTTING PC IN SAMPLE
+# except PC5, heatmaps show individuals generally cluster together (GOOD!)
+# PC5 shows greater variance in blood than eye (possible cell-type correlation)
+# TODO: Houseman et al. composition inference
+library(ggplot2) # my favourite library for scatter plots!
+library(reshape)
+library(gtable)
+
+# preparing data frame for plotting
+pcsort <-data.frame(pc$x[order(substr(rownames(pc$x), 5, 5)),, drop=FALSE])
+pcsort$tissue <- recode(substr(row.names(pcsort), 5, 5), "'B' = 'blood'; 'C'='choroid'; 'R'='retina'; 'O'='optic nerve'")
+pcsort$ID <- factor(row.names(pcsort), levels = rownames(pcsort)[order(substr(rownames(pcsort), 5, 5))])
+pcsort$ind <- substr(pcsort$ID, 1, 4)
+pcsort$color <- recode(pcsort$tissue,"'blood'='red';'choroid'='green';'retina'='blue'; 'optic nerve'='yellow'")
+
+# creating plotting function:
+# the plot itself is basic but the formatting is hackish; hopefully resolved in a ggplot update
+# script for formatting is adapted from http://stackoverflow.com/questions/19440069/ggplot2-facet-wrap-strip-color-based-on-variable-in-data-set
+plotPC <- function(aesfunc) {
+  p1 <- ggplot(pcsort, aesfunc) + 
+    theme_bw() + 
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          axis.text.x=element_text(angle=270, size=8, vjust=0.5)) +
+    geom_rect(aes(fill=color), xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf, alpha = 0.03) +
+    geom_line(alpha=0.5, colour='#333333') +
+    scale_x_discrete(limits=levels(pcsort$ind)) + 
+    facet_grid(. ~ tissue) +
+    scale_fill_identity(guide = 'legend',
+                        labels = c('retina', 'choroid', 'blood', 'optic nerve'),
+                        name = "tissues") +
+    xlab("ID")
+  
+  dummy <- ggplot(pcsort, aesfunc) + facet_grid(. ~ tissue) +
+    geom_rect(aes(fill=color), xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf) +
+    theme_minimal() +
+    scale_fill_identity()
+  
+  g1 <- ggplotGrob(p1)
+  g2 <- ggplotGrob(dummy)
+  
+  gtable_select <- function (x, ...) 
+  {
+    matches <- c(...)
+    x$layout <- x$layout[matches, , drop = FALSE]
+    x$grobs <- x$grobs[matches]
+    x
+  }
+  
+  panels <- grepl(pattern="panel", g2$layout$name)
+  strips <- grepl(pattern="strip_top", g2$layout$name)
+  g2$layout$t[panels] <- g2$layout$t[panels] - 1
+  g2$layout$b[panels] <- g2$layout$b[panels] - 1
+  
+  
+  new_strips <- gtable_select(g2, panels | strips)
+  grid.newpage()
+  grid.draw(new_strips)
+  
+  gtable_stack <- function(g1, g2){
+    g1$grobs <- c(g1$grobs, g2$grobs)
+    g1$layout <- transform(g1$layout, z= z-max(z), name="g2")
+    g1$layout <- rbind(g1$layout, g2$layout)
+    g1
+  }
+  new_plot <- gtable_stack(g1, new_strips)
+  grid.newpage()
+  grid.draw(new_plot)
+}
+# TODO: resolve alpha of plot legends (guide.override is not working, possibly due to geom_rect?)
+# TODO: resolve tissue names not showing up in facet strips (something to do with gtable layers)
+
+# Unfortunately, since ggplot aes function uses global variables, vars cannot be 
+# defined in aes as arguments, and aes can't be stored in a list.
+# So, while annoying and repetitive, each aes must be manually defined 
+# for each PC instead of using iteration:
+aesfunc1 <-	aes(x = ind, y = PC1, group = tissue)
+aesfunc2 <- aes(x = ind, y = PC2, group = tissue)
+aesfunc3 <- aes(x = ind, y = PC3, group = tissue)
+aesfunc4 <- aes(x = ind, y = PC4, group = tissue)
+aesfunc5 <- aes(x = ind, y = PC5, group = tissue)
+aesfunc6 <- aes(x = ind, y = PC6, group = tissue)
+aesfunc7 <- aes(x = ind, y = PC7, group = tissue)
+aesfunc8 <- aes(x = ind, y = PC8, group = tissue)
+aesfunc9 <- aes(x = ind, y = PC9, group = tissue)
+aesfunc10 <- aes(x = ind, y = PC10, group = tissue)
+aesfunc11 <- aes(x = ind, y = PC11, group = tissue)
+aesfunc12 <- aes(x = ind, y = PC12, group = tissue)
+aesfunc13 <- aes(x = ind, y = PC13, group = tissue)
+aesfunc14 <- aes(x = ind, y = PC14, group = tissue)
+aesfunc15 <- aes(x = ind, y = PC15, group = tissue)
+aesfunc16 <- aes(x = ind, y = PC16, group = tissue)
+aesfunc17 <- aes(x = ind, y = PC17, group = tissue)
+aesfunc18 <- aes(x = ind, y = PC18, group = tissue)
+aesfunc19 <- aes(x = ind, y = PC19, group = tissue)
+aesfunc20 <- aes(x = ind, y = PC20, group = tissue)
+aesfunc21 <- aes(x = ind, y = PC21, group = tissue)
+aesfunc22 <- aes(x = ind, y = PC22, group = tissue)
+aesfunc23 <- aes(x = ind, y = PC23, group = tissue)
+aesfunc24 <- aes(x = ind, y = PC24, group = tissue)
+aesfunc25 <- aes(x = ind, y = PC25, group = tissue)
+aesfunc26 <- aes(x = ind, y = PC26, group = tissue)
+aesfunc27 <- aes(x = ind, y = PC27, group = tissue)
+aesfunc28 <- aes(x = ind, y = PC28, group = tissue)
+aesfunc29 <- aes(x = ind, y = PC29, group = tissue)
+# NOW we can iterate through the aes variables to draw the graph.
+numpc <- ncol(pc$x)
+for (counter in 1:numpc) { 
+  png(paste('lineplot_PC', counter, '.png', sep = ""), width = 500, height = 300)
+  plotPC(get(paste('aesfunc', counter, sep="")))
+  dev.off()
+}
+# deleting all aesfunc variables as they are no longer needed
+rm(list = c(paste0("aesfunc", 1:numpc)))
+
+
+
+# ENOUGH WITH PCs FOR NOW #
+##########################################################################################
+# CORRELATION MATRIX
+# corbeta <- cor(batchBeta, method = "pearson")
+# corbetavar <- cor(betavarblood, method = "pearson")
+# diag <- as.vector(lower.tri(corbeta, diag = FALSE))
+# corbetav <- as.vector(corbeta)[diag]
+# corMatToVec <- function(mat, tissue1 = "B", tissue2) {
+#   vec <- as.vector(mat[substr(colnames(mat), 5, 5) == tissue1,  substr(colnames(mat), 5, 5) == tissue2])
+#   vec
+# }
+# # Getting medians and ranges
+# median(corMatToVec(corbeta, tissue2 = "C"))
+# range(corMatToVec(corbeta, tissue2 = "C"))
+# median(corMatToVec(corbeta, tissue2 = "O"))
+# range(corMatToVec(corbeta, tissue2 = "O"))
+# median(corMatToVec(corbeta, tissue2 = "R"))
+# range(corMatToVec(corbeta, tissue2 = "R"))
+# 
+
+
+# CALCULATING VARIABLE PROBES
+# As per Hannon et al, except since we have less samples, decided to use SD instead
+# percentiles
+beta.blood <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'B']
+beta.choroid <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'C']
+beta.optic <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'O']
+beta.retina <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'R']
+# Calculating sd of each cpg, using beta values as it's more intuitive but the function
+# can be used for M or beta
+getVarProbes <- function(beta, prop) {
+  sddf <- data.frame(apply(beta, 1, sd))
+  colnames(sddf) <- c('SD')
+  betavar <- data.frame(sddf[order(sddf$SD, decreasing =TRUE),, drop=FALSE])
+  betavar <- data.frame(betavar[1:(prop * nrow(beta)),, drop = FALSE ])
+  colnames(betavar) <- c('SD')
+  betavar
+}
+
+# as in Hannon et al., getting probes where the inner 80th percentile range is > 5%
+getVarQuantile <- function(beta, upperq = 90, lowerq = 10, ranlim = 5) {
+  require('matrixStats')
+  
+  q <- rowQuantiles(beta, probs = c(upperq / 100, lowerq / 100))
+  r <- q[, 1] - q[, 2]
+  r <- as.matrix(r[r > (ranlim / 100), drop = FALSE])
+}
+
+# Getting top 25% most variable probes for blood
+# bloodvar.top <- getVarProbes(beta.blood, 0.25)
+bloodvar.quant <- getVarQuantile(beta.blood) # 224,417 probes
+
+# Correlating blood-variable probes across tissue
+betavarblood <- batchBeta[rownames(batchBeta) %in% rownames(bloodvar.quant), ]
+bloodvar <- betavarblood[, substr(colnames(betavarblood), 5, 5) == 'B']
+bloodnonvar <- batchBeta[!(rownames(batchBeta) %in% rownames(bloodvar.quant)), substr(colnames(betavarblood), 5, 5) == 'B']
+blood <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'B']
+choroid <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'C']
+optic <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'O']
+retina <- batchBeta[, substr(colnames(batchBeta), 5, 5) == 'R']
+
+# Make sure the columns in each beta table are ordered the same way
+matchCols <- function(df1, df2) {
+  
+  df1 <- df1[, match(substr(colnames(df2), 1, 4), substr(colnames(df1), 1, 4))]
+  df2 <- df2[, match(substr(colnames(df1), 1, 4), substr(colnames(df2), 1, 4))]
+  
+  return(list(df1, df2))
+}
+
+# Permuting samples
+# as per Hannon et al., to see distribution where there is no relationship between
+# blood and eye tissue
+permuteCol <- function(data) {
+  data <- data.frame(data)
+  d2 <- data[, sample(ncol(data))]
+  d2
+} 
+
+# Correlation function (would be better refactored with dplyr but will suffice) pairwise
+corFunc <- function(tissue1, tissue2, permute = FALSE, method = "pearson", exact = TRUE) {
+  df <- matchCols(tissue1, tissue2)
+   
+   tissue1 <- data.frame(df[1])
+   tissue2 <- data.frame(df[2])
+   
+   tissue1$NA. <- NULL
+   tissue2$NA. <- NULL
+   
+   if (permute) {
+     tissue1 <- permuteCol(tissue1)
+     tissue2 <- permuteCol(tissue2)
+   }
+   
+  cormat <- matrix(0, nrow = nrow(tissue1), ncol = 2)
+  rownames(cormat) <- rownames(tissue1)
+  colnames(cormat) <- c('r', 'p-value')
+  
+  tissue1 <- as.matrix(tissue1)
+  tissue2 <- as.matrix(tissue2)
+  
+  for (i in 1:nrow(tissue1)) {
+    test <- cor.test(tissue1[i, ], tissue2[i, ], method = method, exact = exact)
+    cormat[i, 1] <- test$estimate
+    cormat[i, 2] <- test$p.value
+  }
+  cormat
+}
+
+cor.bc <- corFunc(blood, choroid)
+cor.bo <- corFunc(blood, optic)
+cor.br <- corFunc(blood, retina)
+
+cor.bcs <- corFunc(blood, choroid, method = "spearman", exact = FALSE)
+cor.bos <- corFunc(blood, optic, method = "spearman", exact = FALSE)
+cor.brs <- corFunc(blood, retina, method = "spearman", exact = FALSE)
+
+# filter the probes which are correlated at |r| > 0.5 and p < 0.05
+filterCor <- function(cortable, r = 0.5, p = 0.05) {
+  cortable <- data.frame(cortable)
+  cortable <- cortable[abs(cortable$r) > r, ]
+  rownames(cortable[cortable$p.value < p, ])
+}
+getCorProbes <- function(beta, corprobes) {
+  beta[rownames(beta) %in% corprobes, ]
+}
+
+# using Spearman correlations from now on (Pearson's kept for comparison)
+
+bc <- getCorProbes(batchBeta, filterCor(cor.bcs))
+bo <- getCorProbes(batchBeta, filterCor(cor.bos))
+br <- getCorProbes(batchBeta, filterCor(cor.brs))
+bco <- bc[rownames(bc) %in% rownames(bo),]
+bcor <- bc[rownames(bc) %in% rownames(bo) & rownames(bc) %in% rownames(br),]
+bcor13 <- bcor[rownames(bcor) %in% rownames(probes13), ]
+# Heatmaps of correlated beta values
+corHeatmap <- function(beta, tissue) {
+  pdf(paste('heatmap_corr_', tissue, '.pdf', sep=""), width = 9, height = 11.5)
+  heatmap.3(t(beta),
+            dendrogram = "row",
+            bty = "l",
+            RowSideColors = colorMatrix,
+            RowSideColorsSize = 2,
+            lmat=rbind(c(0, 0, 0, 0), c(5, 0, 0, 0), c(0, 4, 0, 0), c(3, 2, 1, 0), c(0, 0, 0, 0)), # positioning (see http://stackoverflow.com/questions/15351575/moving-color-key-in-r-heatmap-2-function-of-gplots-package)
+            lhei=c(0.3, 0.8, 0.5, 4, 0.3),
+            lwid=c(1, 4, 0.3, 0.3),
+            trace = "none",
+            scale = "none",
+            col = div.color.scale,
+            labRow = substr(rownames(t(beta)), 1, 4),
+            cexRow = 1.5,
+            labCol = " ",
+            main = paste("Heatmap of blood-", tissue, " correlated probes", sep=""))
+  legend("topright", inset=c(-0.05, -0.01),
+         xpd = TRUE,
+         ncol = 2,
+         legend = c("Blood", "Choroid", "Retina",  "Optic Nerve", NA, NA, NA, NA, "3631", "3675" , "3677","3684", "3685", "3689","3682" , "3701"),
+         fill = c('#F43D6B', '#83F03C', '#534ED9', '#FFD140', NA, NA, NA, NA, "#8dd3c7", "#ffffb3", "#bebada", "#fb8072", "#80b1d3", "#fdb462", "#b3de69", "#fccde5"),
+         border = FALSE,
+         bty = "n")
+  dev.off()
+}
+
+corHeatmap(bcor, 'eye')
+corHeatmap(bc, 'choroid')
+corHeatmap(bo, 'optic-nerve')
+corHeatmap(br, 'retina')
+corHeatmap(bco, 'choroid-optic')
+
+# Correlation densities
+# the correlation column must be named r
+corrDensity <- function(cortable, permtable, filename = "density_plot.png") {
+  require('ggplot2')
+  
+  cortable <- data.frame(cortable)
+  permtable <- data.frame(permtable)
+  
+  ggplot(permtable, aes(x = r)) + 
+    geom_histogram(data = cortable, aes(y = ..density..), binwidth = .015, fill = "#1a75ff", alpha = 0.8) +
+    geom_histogram(data = permtable, aes(y = ..density..), binwidth = .015, fill = "white", alpha = 0.8)
+  ggsave(filename = filename, height = 3, width = 3)
+}
+
+# Compare permuted samples with matched correlations
+# density plot
+permColWrapper <- function(tissue1, tissue2, filename = "density_plot.png") {
+  cor <- corFunc(tissue1, tissue2)
+  corp <- corFunc(tissue1, tissue2, TRUE)
+  
+  corrDensity(cor, corp, filename)
+}
+
+
+# Do this for every tissue (as permutations are random, will be different every time)
+# permutations used are seeded below
+# permColWrapper(blood, choroid, "density_blood_vs_choroid.png")
+# permColWrapper(blood, optic, "density_blood_vs_optic.png")
+# permColWrapper(blood, retina, "density_blood_vs_retina.png")
+
+# seeding (i.e. saving current permutation) uncomment and rerun to reseed permutation
+cor.bcps <- corFunc(blood, choroid, TRUE, "spearman", FALSE)
+cor.bops <- corFunc(blood, optic, TRUE, "spearman", FALSE)
+cor.brps <- corFunc(blood, retina, TRUE, "spearman", FALSE)
+# write.csv(cor.bcp, "blood-choroid_permutation.csv")
+# write.csv(cor.bop, "blood-optic_permutation.csv")
+# write.csv(cor.brp, "blood-retina_permutation.csv")
+# corrDensity(cor.bc, cor.bcp, "density_blood_vs_choroid.png")
+# corrDensity(cor.bo, cor.bop, "density_blood_vs_optic.png")
+# corrDensity(cor.br, cor.brp, "density_blood_vs_retina.png")
+
+corrDensity(cor.bcs, cor.bcp, "density_blood_vs_choroid_spearman.png")
+corrDensity(cor.bos, cor.bop, "density_blood_vs_optic_spearman.png")
+corrDensity(cor.brs, cor.brp, "density_blood_vs_retina_spearman.png")
+
+
+
+# Rank sum test to see if distributions are equal
+wilcox.test(cor.bcs[, 1], cor.bcps[, 1])
+wilcox.test(cor.bos[, 1], cor.bops[, 1])
+wilcox.test(cor.brs[, 1], cor.brps[, 1])
+# all p-values found to be < 2.2e-16 (limit) for both Spearman and Pearson
+
+
+# INVESTIGATING HYPO- AND HYPER-METHYLATED SITES
+require(matrixStats)
+# calculating mean beta per tissue
+beta.means <- data.frame(rowMeans(batchBeta[, substr(colnames(batchBeta), 5, 5) == 'B']))
+colnames(beta.means) <- 'B'
+beta.means$C <- rowMeans(batchBeta[, substr(colnames(batchBeta), 5, 5) == 'C'])
+beta.means$O <- rowMeans(batchBeta[, substr(colnames(batchBeta), 5, 5) == 'O'])
+beta.means$R <- rowMeans(batchBeta[, substr(colnames(batchBeta), 5, 5) == 'R'])
+
+# drawing Venn diagrams for methylation
+usePackage('VennDiagram')
+methVenn <- function(blood, choroid, optic, retina, filename = "venn_methyl") {
+  venn.diagram(list(A = rownames(blood),
+                    B = rownames(optic),
+                    C = rownames(choroid),
+                    D = rownames(retina)), 
+               filename = filename,
+               imagetype = "svg",
+               category.names = c("Blood", "Optic Nerve", "RPE/Choroid", "Neurosensory Retina"),
+               fill = c("light grey", "white", "white", "white"),
+               cat.fontfamily = rep("sans-serif", 4))
+}
+
+methVenn(beta.means[beta.means$B <= 0.2, ], 
+         beta.means[beta.means$C <= 0.2, ], 
+         beta.means[beta.means$O <= 0.2, ],
+         beta.means[beta.means$R <= 0.2, ],
+         filename = "venn_hypomethylated")
+
+methVenn(beta.means[beta.means$B >= 0.8, ], 
+         beta.means[beta.means$C >= 0.8, ], 
+         beta.means[beta.means$O >= 0.8, ],
+         beta.means[beta.means$R >= 0.8, ],
+         filename = "venn_hypermethylated")
+
+methVenn(beta.means[(beta.means$B < 0.8) & (beta.means$B > 0.2), ], 
+         beta.means[(beta.means$C < 0.8) & (beta.means$C > 0.2), ], 
+         beta.means[(beta.means$O < 0.8) & (beta.means$O > 0.2), ],
+         beta.means[(beta.means$R < 0.8) & (beta.means$R > 0.2), ],
+         filename = "venn_intermediate_methylation")
+
+annMeans <-   merge(beta.means, ann.450k, by = 'row.names')
+annMeans <- colToRowName(annMeans)
+# geneBodyMeans <- annMeans[, c(annMeans@listData$B, 
+#                               annMeans@listData$C, annMeans@listData$O, 
+#                               annMeans@listData$R, annMeans@listData$UCSC_RefGene_Group,
+#                               annMeans@listData$Relation_to_Island, annMeans@listData$Regulatory_Feature_Group)]
+geneBodyMeans <- annMeans[, c(1, 2, 3, 4, 30, 23, 36)]
+gbmstor <- geneBodyMeans
+rm(annMeans)
+
+###############################################################################################################################
+# upset(beta.means, sets = c("B", "C", "EGFR", "PIK3R1", "RB1"), sets.bar.color = "#56B4E9",
+#      order.by = "freq", empty.intersections = "on")
+###############################################################################################################################
+###############################################################################################################################
+###############################################################################################################################
+# cleaning up annotated table
+usePackage('car')
+geneGroups <- strsplit(geneBodyMeans@listData$UCSC_RefGene_Group, ";")
+firstGeneGroups <- sapply(geneGroups, "[", 1)
+firstGeneGroups[is.na(firstGeneGroups)]  <- "Intergenic"
+geneBodyMeans$groups <- firstGeneGroups
+geneBodyMeans$islands <- recode(geneBodyMeans@listData$Relation_to_Island, "'S_Shore'='Shore'; 'N_Shore'='Shore'; 'OpenSea'='Sea'; 'S_Shelf'='Shelf'; 'N_Shelf'='Shelf'")
+geneBodyMeans$regulatory <- recode(geneBodyMeans$Regulatory_Feature_Group, '"Promoter_Associated" = "Promoter"; "Unclassified_Cell_type_specific" = "Unclassified"; "Promoter_Associated_Cell_type_specific" = "Promoter"; "Gene_Associated_Cell_type_specific" = "Gene-Associated"; "Gene_Associated" =  "Gene-Associated"; "NonGene_Associated_Cell_type_specific" = "Non-Gene-Associated"; "NonGene_Associated" = "Non-Gene-Associated"')
+geneBodyMeans$UCSC_RefGene_Group <- NULL
+geneBodyMeans$Relation_to_Island <- NULL
+geneBodyMeans$Regulatory_Feature_Group <- NULL
+rm(geneGroups, firstGeneGroups)
+
+# matching vectors
+probes13 <- data.frame(probeFilter(13, cor))
+
+geneBodyMeans$blood.var <- match(rownames(geneBodyMeans), rownames(betavarblood))
+geneBodyMeans$bc <- match(rownames(geneBodyMeans), rownames(bc))
+geneBodyMeans$bo <- match(rownames(geneBodyMeans), rownames(bo))
+geneBodyMeans$br <- match(rownames(geneBodyMeans), rownames(br))
+geneBodyMeans$pc13 <- match(rownames(geneBodyMeans), rownames(probes13))
+
+recodeBinaryNA <- function(dat) {
+  dat[!is.na(dat)] <- 1
+  dat[is.na(dat)] <- 0
+  
+  dat
+}
+
+geneBodyMeans$blood.var <- recodeBinaryNA(geneBodyMeans$blood.var)
+geneBodyMeans$bc <- recodeBinaryNA(geneBodyMeans$bc)
+geneBodyMeans$bo <- recodeBinaryNA(geneBodyMeans$bo)
+geneBodyMeans$br <- recodeBinaryNA(geneBodyMeans$br)
+geneBodyMeans$pc13 <- recodeBinaryNA(geneBodyMeans$pc13)
+
+# recoding methylation levels
+# 1 <= 0.2 hypo
+# 2 = 0.2 - 0.8 inter
+# 3 >= 0.8 hyper
+geneBodyMeans$B <- cut(geneBodyMeans$B, c(0, 0.2, 0.799999, 1), labels = FALSE)
+geneBodyMeans$C <- cut(geneBodyMeans$C, c(0, 0.2, 0.799999, 1), labels = FALSE)
+geneBodyMeans$O <- cut(geneBodyMeans$O, c(0, 0.2, 0.799999, 1), labels = FALSE)
+geneBodyMeans$R <- cut(geneBodyMeans$R, c(0, 0.2, 0.799999, 1), labels = FALSE)
+
+# separating tissues # this is only useful for the graphs
+geneBody.c <- geneBodyMeans[(geneBodyMeans$bc == 1) & (geneBodyMeans$blood.var == 1), c(1, 2, 5, 6, 7, 8)]
+geneBody.c$both <- as.factor(paste("B", geneBody.c$B, "E", geneBody.c$C, sep=""))
+geneBody.o <- geneBodyMeans[(geneBodyMeans$bo == 1) & (geneBodyMeans$blood.var == 1), c(1, 3, 5, 6, 7, 8)]
+geneBody.o$both <- as.factor(paste("B", geneBody.o$B, "E", geneBody.o$O, sep=""))
+geneBody.r <- geneBodyMeans[(geneBodyMeans$br == 1) & (geneBodyMeans$blood.var == 1), c(1, 4, 5, 6, 7, 8)]
+geneBody.r$both <- as.factor(paste("B", geneBody.r$B, "E", geneBody.r$R, sep=""))
+geneBody.c$type  <- "Choroid |r| > 0.5"
+geneBody.o$type  <- "Optic Nerve |r| > 0.5"
+geneBody.r$type  <- "Retina |r| > 0.5"
+geneBody <- rbind(as.matrix(geneBody.c), as.matrix(geneBody.o), as.matrix(geneBody.r))
+
+# getting all probes (no correlates, no var)
+usePackage('car')
+temp <- geneBodyMeans[, c(1, 2, 5, 6, 7, 8, 1)]
+temp[, 6] <- rep(0, nrow(temp))
+temp[, 7] <- recode(temp[, 7], '2 = 5; 3 = 9')
+rownames(temp) <- c(1:nrow(temp)) 
+temp$type <- rep("All probes", nrow(temp))
+geneBody.all <- rbind(geneBody, as.matrix(temp))
+rownames(geneBody.all) <- c(1:nrow(geneBody.all))
+
+# getting blood-var probes
+temp2 <- geneBodyMeans[geneBodyMeans$blood.var == 1, c(1, 2, 5, 6, 7, 8, 1)]
+temp2[, 7] <- recode(temp2[, 7], '2 = 5; 3 = 9')
+rownames(temp2) <- c(1:nrow(temp2)) 
+temp2$type <- rep("Blood-variable probes", nrow(temp2))
+geneBody.all <- rbind(geneBody.all, as.matrix(temp2))
+rownames(geneBody.all) <- c(1:nrow(geneBody.all))
+
+# getting PC13 probes
+temp3 <- geneBodyMeans[geneBodyMeans$pc13 == 1, c(1, 2, 5, 6, 7, 8, 1)]
+temp3[, 7] <- recode(temp3[, 7], '2 = 5; 3 = 9')
+rownames(temp3) <- c(1:nrow(temp3)) 
+temp3$type <- rep("PC13-related probes", nrow(temp3))
+temp3.mat <- as.matrix(temp3)
+geneBody.all <- rbind(geneBody.all, temp3.mat)
+rownames(geneBody.all) <- c(1:nrow(geneBody.all))
+
+# can change alpha to emphasize the non-variable probes
+ggplot(data.frame(geneBody.all), aes(x = type, fill = both, alpha = blood.var)) +  
+  geom_bar(aes(y =((..count..)/tapply(..count..,..x..,sum)[..x..]) * 100)) +
+  facet_grid(~ groups) +
+  scale_x_discrete(limits = c("All probes","Blood-variable probes","Choroid |r| > 0.5","Optic Nerve |r| > 0.5","Retina |r| > 0.5","PC13-related probes")) +
+  scale_alpha_discrete(range = c(1, 1), guide='none') +
+  scale_fill_manual(name="Methylation Status", 
+                    values = c("9" = "#d73027",
+                               "8" = "#f46d43",
+                               "7" = "#fdae61",
+                               "6" = "#fee090",
+                               "5" = "#ffffbf",
+                               "4" = "#e0f3f8",
+                               "3" = "#abd9e9",
+                               "2" = "#74add1",
+                               "1" = "#4575b4"),
+                    breaks = c("1","2","3","4","5","6","7","8","9"),
+                    labels = c("B1E1","B1E2","B1E3","B2E1","B2E2","B2E3","B3E1","B3E2","B3E3")) + 
+  theme(axis.title.x = element_blank(), plot.background = element_blank(), axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "Percentage %")
+ggsave(filename = "gene_regions_tissue_blood-eye_pc13.svg", width = 7, height = 7)
+
+# repeating graph for gene islands
+ggplot(data.frame(geneBody.all), aes(x = type, fill = both)) +  
+  geom_bar(aes(y =((..count..)/tapply(..count..,..x..,sum)[..x..]) * 100)) +
+  facet_grid(~ islands) +
+  scale_x_discrete(limits = c("All probes","Blood-variable probes","Choroid |r| > 0.5","Optic Nerve |r| > 0.5","Retina |r| > 0.5","PC13-related probes")) +
+  scale_fill_manual(name="Methylation Status", 
+                    values = c("9" = "#d73027",
+                               "8" = "#f46d43",
+                               "7" = "#fdae61",
+                               "6" = "#fee090",
+                               "5" = "#ffffbf",
+                               "4" = "#e0f3f8",
+                               "3" = "#abd9e9",
+                               "2" = "#74add1",
+                               "1" = "#4575b4"),
+                    breaks = c("1","2","3","4","5","6","7","8","9"),
+                    labels = c("B1E1","B1E2","B1E3","B2E1","B2E2","B2E3","B3E1","B3E2","B3E3")) + 
+  theme(axis.title.x = element_blank(), plot.background = element_blank(), axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(y = "Percentage %")
+ggsave(filename = "gene_islands_tissue_blood-eye_pc13.svg", width = 5.5, height = 7)
+
+
+
+probesbc <- intersect(rownames(bloodvar.quant), rownames(bc))
+probesbo <- intersect(rownames(bloodvar.quant), rownames(bo))
+probesbr <- intersect(rownames(bloodvar.quant), rownames(br))
+
+# comparing blood-eye correlates
+venn.diagram(list(A = probesbo,
+                  B = probesbc,
+                  C = probesbr),
+             filename = "venn_blood-eye-bloodvar",
+             category.names = c("Optic Nerve", "RPE/Choroid", "Neurosensory Retina"),
+             fill = c("white", "white", "white"),
+             cat.fontfamily = rep("sans-serif", 3))
+
+# comparing blood-eye correlates, in blood-variable probes with PC13
+probes13 <- data.frame(probeFilter(13, cor))
+venn.diagram(list(A = rownames(probes13),
+                  B = probesbo,
+                  C = probesbc,
+                  D = probesbr),
+             filename = "venn_blood-eye-pc13-bloodvar",
+             category.names = c("PC13-associated", "Optic Nerve", "RPE/Choroid", "Neurosensory Retina"),
+             fill = c("light grey", "white", "white", "white"),
+             cat.fontfamily = rep("sans-serif", 4))
+
+# comparing blood-eye correlates, in blood-variable probes with PC1
+probes1 <- data.frame(probeFilter(1, cor))
+venn.diagram(list(A = rownames(probes1),
+                  B = probesbo,
+                  C = probesbc,
+                  D = probesbr),
+             filename = "venn_blood-eye-pc1-bloodvar",
+             category.names = c("PC1-associated", "Optic Nerve", "RPE/Choroid", "Neurosensory Retina"),
+             fill = c("light grey", "white", "white", "white"),
+             cat.fontfamily = rep("sans-serif", 4))
+
+
+
+
+
+# cleanup vars (hoooo boy)
+rm(temp, temp2, geneBody, geneBody.all, geneBodyAll, geneBody.c, geneBody.o, geneBody.r, temp3.mat, probes13)
+
+proc.time() - start.time
+
+# END OF SCRIPT
+##########################################################################################
+# CREATING BETA TABLES #
+
+
+# Creating beta tables for PC-correlated probes
+corPCsite <- function(beta, pctable = pc$x, pcnum) {
+  df <- data.frame(beta)
+  p <- matrix(ncol = 1, nrow = nrow(beta))
+  r <- matrix(ncol = 1, nrow = nrow(beta))
+  
+  for (i in 1:nrow(beta)) {
+    c <- cor.test(beta[i, ], pc$x[, pcnum], method = "spearman")
+    p[i] <- c$p.value
+    r[i] <- c$estimate
+  }
+  
+  df$r <- r[, 1]
+  df$p.value <- p[, 1]
+  
+  ann <- merge(df, ann.450k, by = 'row.names')
+  
+  write.table(ann, paste('beta_', pcnum, '.csv', sep = ""), row.names = FALSE)
+}
+
+# Creating tables
+corPCsite(probeFilter(1, cor)[[2]], pc$x, 1)
+for (i in 2:29) {
+  corPCsite(probeFilter(i)[[2]], pc$x, i)
+}
+
+
+
+##########################################################################################
+# LINEAR REGRESSION ANALYSIS
+
+# ANOVAtissue <- function(beta) {
+#   tissues <- c('B', 'C', 'O', 'R')
+#   mat <- matrix(NA, nrow = nrow(beta), ncol = 4)
+#   for (i in 1:4) {
+#     beta.t <- beta[, substr(colnames(beta), 5, 5) == tissues[i]]
+#   }
+# }
+
+# Preparing sample tables for each pairwise comparison
+bve.M <- batchM[, substr(colnames(batchM), 1, 4) != '3682']
+bve.pheno <- phenotype[substr(rownames(phenotype), 1, 4) != '3682',]
+
+bvr.M <- bve.M[, (substr(colnames(bve.M), 5, 5) == 'B' | substr(colnames(bve.M), 5, 5) == 'R' )]
+bvr.pheno <- bve.pheno[(substr(rownames(bve.pheno), 5, 5) == 'B' | substr(rownames(bve.pheno), 5, 5) == 'R' ),]
+
+bvc.M <- bve.M[, substr(colnames(bve.M), 1, 4) != '3701']
+bvc.M <- bvc.M[, (substr(colnames(bvc.M), 5, 5) == 'B' | substr(colnames(bvc.M), 5, 5) == 'C' )]
+bvc.pheno <- bve.pheno[substr(rownames(bve.pheno), 1, 4) != '3701', ]
+bvc.pheno <- bvc.pheno[(substr(rownames(bvc.pheno), 5, 5) == 'B' | substr(rownames(bvc.pheno), 5, 5) == 'C' ),]
+
+bvo.M <- bve.M[, substr(colnames(bve.M), 1, 4) != '3701']
+bvo.M <- bvo.M[, (substr(colnames(bvo.M), 5, 5) == 'B' | substr(colnames(bvo.M), 5, 5) == 'O' )]
+bvo.pheno <- bve.pheno[substr(rownames(bve.pheno), 1, 4) != '3701', ]
+bvo.pheno <- bvo.pheno[(substr(rownames(bvo.pheno), 5, 5) == 'B' | substr(rownames(bvo.pheno), 5, 5) == 'O' ),]
+
+rvc.M <- batchM[, substr(colnames(batchM), 1, 4) != '3701']
+rvc.M <- rvc.M[, (substr(colnames(rvc.M), 5, 5) == 'R' | substr(colnames(rvc.M), 5, 5) == 'C' )]
+rvc.pheno <- phenotype[substr(rownames(phenotype), 1, 4) != '3701', ]
+rvc.pheno <- rvc.pheno[(substr(rownames(rvc.pheno), 5, 5) == 'R' | substr(rownames(rvc.pheno), 5, 5) == 'C' ),]
+
+rvo.M <- batchM[, substr(colnames(batchM), 1, 4) != '3701']
+rvo.M <- rvo.M[, (substr(colnames(rvo.M), 5, 5) == 'R' | substr(colnames(rvo.M), 5, 5) == 'O' )]
+rvo.pheno <- phenotype[substr(rownames(phenotype), 1, 4) != '3701', ]
+rvo.pheno <- rvo.pheno[(substr(rownames(rvo.pheno), 5, 5) == 'R' | substr(rownames(rvo.pheno), 5, 5) == 'O' ),]
+
+cvo.M <- batchM[, (substr(colnames(batchM), 5, 5) == 'C' | substr(colnames(batchM), 5, 5) == 'O' )]
+cvo.pheno <- phenotype[(substr(rownames(phenotype), 5, 5) == 'C' | substr(rownames(phenotype), 5, 5) == 'O' ),]
+
+# Creating limma function for pairwise comparison (blocking method):
+# The argument 'opt' is the tissue which has a value of '1' in the design matrix, 
+# and is the tissue that is the 2nd in the row order. This is arbitrary and does not affect calculations.
+getTopRank <- function(intvar, groupvar, M, opt) {
+  var<- factor(intvar)
+  group <- factor(groupvar)
+  design <- model.matrix(~var + group)
+  fit <- lmFit(M, design)
+  fit2 <- eBayes(fit)
+  table <- topTable(fit2, coef = paste('var', opt, sep = ""), num = Inf)
+  table
+}
+bve.table <- getTopRank(bve.pheno$tissuebinary, bve.pheno$individual, bve.M, 'eye')
+bvr.table <- getTopRank(bvr.pheno$tissue, bvr.pheno$individual, bvr.M, 'retina')
+bvc.table <- getTopRank(bvc.pheno$tissue, bvc.pheno$individual, bvc.M, 'choroid')
+bvo.table <- getTopRank(bvo.pheno$tissue, bvo.pheno$individual, bvo.M, 'opticnerve')
+rvc.table <- getTopRank(rvc.pheno$tissue, rvc.pheno$individual, rvc.M, 'retina')
+rvo.table <- getTopRank(rvo.pheno$tissue, rvo.pheno$individual, rvo.M, 'retina')
+cvo.table <- getTopRank(cvo.pheno$tissue, cvo.pheno$individual, cvo.M, 'opticnerve')
+
+# Setting helper functions
+colToRowName <- function(df) {
+  df2 <- df[,-1]
+  rownames(df2) <- df[,1]
+  
+  df2
+}
+mergeAndAnnotate <- function(M, ptable, filename) {
+  require('lumi')
+  beta <- m2beta(M)
+  df <- merge(beta, ptable, by = 'row.names')
+  df <- colToRowName(df)
+  df <- merge(df, ann.450k, by = 'row.names')
+  df <- colToRowName(df)
+  df <- df[order(df$t, decreasing = TRUE), , drop = FALSE]
+  write.table(df, filename, col.names = NA)
+}
+
+# Creating tables
+mergeAndAnnotate(bve.M, bve.table, 'blood_vs_eye.csv')
+mergeAndAnnotate(bvr.M, bvr.table, 'blood_vs_retina.csv')
+mergeAndAnnotate(bvc.M, bvc.table, 'blood_vs_choroid.csv')
+mergeAndAnnotate(bvo.M, bvo.table, 'blood_vs_opticnerve.csv')
+mergeAndAnnotate(rvc.M, rvc.table, 'choroid_vs_retina.csv')
+mergeAndAnnotate(rvo.M, rvo.table, 'opticnerve_vs_retina.csv')
+mergeAndAnnotate(cvo.M, cvo.table, 'choroid_vs_opticnerve.csv')
+
+# Cleaning variables
+rm(bve.M, bve.pheno, bve.table, bvr.M, bvr.pheno, bvr.table, bvc.M, bvc.pheno, bvc.table, bvo.M, bvo.pheno, bvo.table, rvc.M, rvc.table, rvc.pheno, rvo.table, rvo.pheno, rvo.M, cvo.table, cvo.pheno, cvo.M)
+
+
+
+############################################################################################
+# PATHWAY ANALYSIS PREPROCESSING
+
+# PREPARING BETA TABLES
+# without removal of tissue-related probes (TODO: investigate overlap)
+probes9 <- probeFilter(9, cor)
+probes11 <- probeFilter(11, cor)
+probes13 <- probeFilter(13, cor)
+# Combining interindividual variation-related probes
+ind.probes <- unique(rbind(probes9[[2]], probes11[[2]], probes13[[2]]))
+
+# OBTAINING GENE LISTS FOR GO
+getGeneList <- function(beta, ann = ann.450k) {
+  df <- data.frame(beta)
+  ann.beta <- data.frame(merge(df, ann, by = 'row.names'))
+  res <- c()
+  for (i in 1:nrow(df)) {
+    res <- append(res, strsplit(as.character(ann.beta$UCSC_RefGene_Name[i]), ";"))
+  }
+  result <- unlist(res, recursive=FALSE)
+  result <- unique(result)
+  result
+}
+
+gene9 <- getGeneList(probes9)
+gene11 <- getGeneList(probes11)
+gene13 <- getGeneList(probes13)
+gene.ind <- getGeneList(ind.probes)
+
+write.csv(data.frame(gene9), file = "genelist_PC9.csv", row.names = FALSE)
+write.csv(data.frame(gene11), file = "genelist_PC11.csv", row.names = FALSE)
+write.csv(data.frame(gene13), file = "genelist_PC13.csv", row.names = FALSE)
+write.csv(data.frame(gene.ind), file = "genelist_PC9-11-13.csv", row.names = FALSE)
+
+# creating Venn diagrams of gene overlaps
+usePackage("VennDiagram")
+venn.diagram(list(A = c(gene9), 
+                  B = c(gene11), 
+                  C = (gene13)), 
+             filename = "venn_individualPC.tif",
+             height = 1000,
+             width = 1000,
+             cex = 0.8,
+             cat.cex = 0.6,
+             cat.dist = 0.05,
+             category.names = c("PC9", "PC11", "PC13"), 
+             col = "transparent",
+             fill = c("red", "blue", "green"),
+             alpha = 0.3)
+
+# CV CALCULATIONS
+require(matrixStats)
+
+rowCV <- function(beta) {
+  rowSds(beta) / rowMeans(beta)
+}
+
+# calculating CV for each tissue
+cv <- data.frame(rowCV(batchBeta[, substr(colnames(batchBeta), 5, 5) == "B"]))
+colnames(cv) <- "blood"
+cv$choroid <- rowCV(batchBeta[, substr(colnames(batchBeta), 5, 5) == "C"])
+cv$retina <- rowCV(batchBeta[, substr(colnames(batchBeta), 5, 5) == "R"])
+cv$opticnerve <- rowCV(batchBeta[, substr(colnames(batchBeta), 5, 5) == "O"])
+
+individual <- unique(phenotype$individual)
+for (i in 1:8) {
+  cv[individual[i]] <- rowCV(batchBeta[, substr(colnames(batchBeta), 1, 4) == individual[i]])
+}
+
+cv$tissue.sum <- rowSums(cv[, c(5:10)])
+cv$all <- rowCV(batchBeta)
+
+# getting most variable cross-tissue CV probes
+varCV <- batchBeta[rownames(batchBeta) %in% 
+                     rownames(cv[order(cv$tissue.sum, decreasing = TRUE),
+                                 , drop = FALSE][c(1:20000), , drop = FALSE]), ]
+# this heatmap has weird white lines on it - reducing the number of probes solves this
+png('heatmap_CV_tissue_20000.png', width = 1000, height = 1000)
+heatmap.2(t(varCV),
+          dendrogram = "row",
+          RowSideColors = sampleColours,
+          lmat=rbind(c(0, 0, 4, 0, 0), c(0, 3, 2, 1, 0), c(0, 5, 0, 0, 0)),
+          lhei=c(0.5, 4, 0.8),
+          lwid=c(0.25, 1, 4, 0.1, 0.5),
+          trace = "none",
+          scale = "none",
+          col = div.color.scale,
+          labRow = substr(rownames(t(varCV)), 1, 4),
+          cexRow = 1.5,
+          labCol = " ",
+          main = "Heatmap of beta-values - 20,000 most variable probes across tissues")
+dev.off()
+
+gene.tissueCV <- getGeneList(varCV)
+gene.intersect <- intersect(gene.tissueCV, gene.ind)
+
+write.csv(data.frame(gene.tissueCV), file = "genelist_cross-tissue-CV.csv", row.names = FALSE)
+write.csv(data.frame(gene.intersect), file = "genelist_PC9-11-13-cross-tissue-CV-intersect.csv", row.names = FALSE)
+
+rm(gene.ind, gene13, gene11, gene9, probes13, probes11, probes9, ind.genelist, ind.probes, gene.intersect, gene.tissueCV, varord, varCV, i)
